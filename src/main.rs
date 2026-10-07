@@ -8,6 +8,7 @@ mod worker;
 
 use eframe::egui;
 use egui::{Color32, FontFamily, RichText};
+use gallery::{Action, Cache, Gallery, Thumb};
 use import::{Progress, RemoteFile, Report, Stop, Summary};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +40,11 @@ struct App {
     rate: (Instant, String),
     done: Option<(Report, PathBuf)>,
     error: Option<String>,
+    ctx: egui::Context,
+    /// Открыт экран галереи.
+    gallery: Option<Gallery>,
+    /// Миниатюры по ключу плитки; живут, пока подключён тот же телефон.
+    thumbs: Cache<Thumb>,
 }
 
 impl App {
@@ -59,6 +65,9 @@ impl App {
             rate: (Instant::now(), String::new()),
             done: None,
             error: None,
+            ctx: cc.egui_ctx.clone(),
+            gallery: None,
+            thumbs: Cache::new(gallery::CAP),
         }
     }
 
@@ -67,10 +76,21 @@ impl App {
             match msg {
                 // Во время импорта поток шлёт только Progress/Done; состояние телефона значит, что импорт не идёт.
                 Msg::Phone(phone) => {
-                    if let Phone::Ready { items, .. } = &phone {
-                        self.error = None;
-                        self.new = items.iter().filter(|i| !i.imported).flat_map(|i| i.files.iter().cloned()).collect();
-                        self.new_sum = import::summarize(&self.new);
+                    match &phone {
+                        Phone::Ready { items, .. } => {
+                            self.error = None;
+                            self.new = items.iter().filter(|i| !i.imported).flat_map(|i| i.files.iter().cloned()).collect();
+                            self.new_sum = import::summarize(&self.new);
+                            if let Some(g) = &mut self.gallery {
+                                g.retain(items);
+                            }
+                        }
+                        Phone::Scanning => {}
+                        // Телефон пропал или сменился.
+                        _ => {
+                            self.gallery = None;
+                            self.thumbs.clear();
+                        }
                     }
                     self.importing = None;
                     self.phone = phone;
@@ -87,7 +107,13 @@ impl App {
                     self.importing = None;
                     self.error = Some(e);
                 }
-                Msg::Thumb { .. } => {}
+                Msg::Thumb { path, jpeg } => {
+                    let thumb = jpeg.and_then(|jpeg| {
+                        let tex = gallery::texture(&self.ctx, &path, &jpeg, 160)?;
+                        Some(Thumb { jpeg, tex })
+                    });
+                    self.thumbs.insert(path, thumb);
+                }
             }
         }
     }
@@ -100,6 +126,23 @@ impl App {
         self.cancel.store(false, Ordering::Relaxed);
         let _ = self.cmds.send(Cmd::Import(files));
     }
+
+    fn open_gallery(&mut self) {
+        if let Phone::Ready { items, .. } = &self.phone {
+            self.gallery = Some(Gallery::new(items));
+            self.done = None;
+            // В узком окне помещается три плитки — расширяем.
+            if self.ctx.input(|i| i.viewport().inner_rect).is_some_and(|r| r.width() < 800.0) {
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(880.0, 720.0)));
+            }
+        }
+    }
+
+    fn import_selected(&mut self) {
+        let (Some(g), Phone::Ready { items, .. }) = (self.gallery.take(), &self.phone) else { return };
+        let files = g.files(items);
+        self.start(files);
+    }
 }
 
 impl eframe::App for App {
@@ -107,6 +150,18 @@ impl eframe::App for App {
         self.drain();
         let panel = egui::Frame::new().fill(BG).inner_margin(24);
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
+            if let (Some(g), Phone::Ready { items, .. }) = (self.gallery.as_mut(), &self.phone) {
+                let cmds = &self.cmds;
+                let action = gallery::show(ui, g, items, &mut self.thumbs, &mut |keys| {
+                    let _ = cmds.send(Cmd::Thumbs(keys));
+                });
+                match action {
+                    Action::Back => self.gallery = None,
+                    Action::Import => self.import_selected(),
+                    Action::None => {}
+                }
+                return;
+            }
             ui.spacing_mut().item_spacing.y = 12.0;
             let busy = self.importing.is_some();
 
@@ -243,6 +298,12 @@ impl eframe::App for App {
                 if ui.add_enabled(!busy && n > 0, button).clicked() {
                     self.start(self.new.clone());
                 }
+                ui.vertical_centered(|ui| {
+                    let link = egui::Button::new(RichText::new("Выбрать файлы…").color(BLUE)).frame(false);
+                    if ui.add_enabled(!busy, link).clicked() {
+                        self.open_gallery();
+                    }
+                });
             }
         });
     }
@@ -392,8 +453,64 @@ mod tests {
             rate: (Instant::now(), String::new()),
             done: None,
             error: None,
+            ctx: egui::Context::default(),
+            gallery: None,
+            thumbs: Cache::new(gallery::CAP),
         };
         (app, msg_tx, cmd_rx)
+    }
+
+    fn ready(items: Vec<Item>) -> Msg {
+        Msg::Phone(Phone::Ready { udid: "u".into(), items })
+    }
+
+    #[test]
+    fn thumb_msg_decodes_jpeg_and_remembers_missing() {
+        let (mut app, msgs, _cmds) = app();
+        let mut jpeg = vec![];
+        image::RgbImage::new(4, 2).write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg).unwrap();
+        msgs.send(Msg::Thumb { path: "/A.HEIC".into(), jpeg: Some(jpeg) }).unwrap();
+        msgs.send(Msg::Thumb { path: "/B.HEIC".into(), jpeg: Some(b"not a jpeg".to_vec()) }).unwrap();
+        msgs.send(Msg::Thumb { path: "/C.HEIC".into(), jpeg: None }).unwrap();
+        app.drain();
+        assert!(matches!(app.thumbs.get("/A.HEIC"), Some(Some(t)) if t.tex.size() == [4, 2]));
+        assert!(matches!(app.thumbs.get("/B.HEIC"), Some(None)));
+        assert!(matches!(app.thumbs.get("/C.HEIC"), Some(None)));
+    }
+
+    #[test]
+    fn phone_loss_closes_gallery_and_clears_thumbs() {
+        let (mut app, msgs, _cmds) = app();
+        let items = vec![Item { files: vec![rf("/A.HEIC", 5)], imported: false }];
+        msgs.send(ready(items)).unwrap();
+        app.drain();
+        app.open_gallery();
+        app.thumbs.insert("/A.HEIC".into(), None);
+        msgs.send(Msg::Phone(Phone::Scanning)).unwrap();
+        app.drain();
+        assert!(app.gallery.is_some(), "пересканирование не закрывает галерею");
+        msgs.send(Msg::Phone(Phone::NoDevice)).unwrap();
+        app.drain();
+        assert!(app.gallery.is_none());
+        assert!(!app.thumbs.contains("/A.HEIC"));
+    }
+
+    #[test]
+    fn import_selected_sends_both_live_halves_and_closes_gallery() {
+        let (mut app, msgs, cmds) = app();
+        let items = vec![
+            Item { files: vec![rf("/A.HEIC", 5), rf("/A.MOV", 2)], imported: true },
+            Item { files: vec![rf("/B.JPG", 3)], imported: false },
+        ];
+        msgs.send(ready(items)).unwrap();
+        app.drain();
+        app.open_gallery();
+        let g = app.gallery.as_mut().unwrap();
+        g.selected.clear();
+        g.selected.insert("/A.HEIC".into());
+        app.import_selected();
+        assert!(app.gallery.is_none());
+        assert!(matches!(cmds.try_recv(), Ok(Cmd::Import(f)) if f == vec![rf("/A.HEIC", 5), rf("/A.MOV", 2)]));
     }
 
     #[test]

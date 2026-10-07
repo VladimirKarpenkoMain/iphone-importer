@@ -1964,6 +1964,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1992,6 +1994,7 @@ dependencies = [
  "chrono",
  "eframe",
  "idevice",
+ "image",
  "rfd",
  "tempfile",
  "tokio",
