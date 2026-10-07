@@ -195,10 +195,22 @@ fn grid(
             });
         }
     });
+    let want = with_zoom(want, g, thumbs);
     if !want.is_empty() && want != g.sent {
         request(want.clone());
         g.sent = want;
     }
+}
+
+/// Плитка в увеличении может быть вне экрана — её миниатюру запрашиваем первой.
+fn with_zoom<V>(mut want: Vec<String>, g: &Gallery, thumbs: &Cache<V>) -> Vec<String> {
+    if let Some(z) = &g.zoom
+        && !thumbs.contains(z)
+        && !want.contains(z)
+    {
+        want.insert(0, z.clone());
+    }
+    want
 }
 
 fn tile(ui: &mut egui::Ui, item: &Item, selected: bool, thumb: Option<&Option<Thumb>>) -> egui::Response {
@@ -273,7 +285,9 @@ fn zoom(ui: &mut egui::Ui, g: &mut Gallery, items: &[Item], shown: &[usize], thu
         };
         g.zoom_tex = Some((key.clone(), tex));
     }
-    let tex = g.zoom_tex.as_ref().filter(|(k, _)| *k == key).and_then(|(_, t)| t.clone());
+    let loaded = g.zoom_tex.as_ref().filter(|(k, _)| *k == key);
+    let missing = if loaded.is_some() { "Нет миниатюры" } else { "Загрузка…" };
+    let tex = loaded.and_then(|(_, t)| t.clone());
     let selected = g.selected.contains(&key);
     let modal = egui::Modal::new(egui::Id::new("zoom")).show(ui.ctx(), |ui| {
         match &tex {
@@ -281,7 +295,7 @@ fn zoom(ui: &mut egui::Ui, g: &mut Gallery, items: &[Item], shown: &[usize], thu
                 ui.add(egui::Image::new(t).max_size(egui::vec2(480.0, 480.0)));
             }
             None => {
-                ui.add_sized([360.0, 480.0], egui::Label::new(secondary("Нет миниатюры")));
+                ui.add_sized([360.0, 480.0], egui::Label::new(secondary(missing)));
             }
         }
         for f in &item.files {
@@ -352,6 +366,19 @@ mod tests {
         g.retain(&items);
         assert_eq!(g.files(&items), vec![rf("/C.MOV", 9)]);
         assert!(!g.selected.contains("/A.HEIC"));
+    }
+
+    #[test]
+    fn zoomed_item_without_thumb_is_requested_first() {
+        let items = items();
+        let mut g = Gallery::new(&items);
+        let mut c: Cache<()> = Cache::new(10);
+        assert_eq!(with_zoom(vec!["/A.HEIC".into()], &g, &c), vec!["/A.HEIC"]);
+        g.zoom = Some("/C.MOV".into());
+        assert_eq!(with_zoom(vec!["/A.HEIC".into()], &g, &c), vec!["/C.MOV", "/A.HEIC"]);
+        assert_eq!(with_zoom(vec!["/C.MOV".into()], &g, &c), vec!["/C.MOV"]);
+        c.insert("/C.MOV".into(), None);
+        assert_eq!(with_zoom(vec![], &g, &c), Vec::<String>::new());
     }
 
     #[test]

@@ -45,6 +45,8 @@ struct App {
     gallery: Option<Gallery>,
     /// Миниатюры по ключу плитки; живут, пока подключён тот же телефон.
     thumbs: Cache<Thumb>,
+    /// udid телефона, к которому относятся галерея и миниатюры.
+    udid: String,
 }
 
 impl App {
@@ -68,6 +70,7 @@ impl App {
             ctx: cc.egui_ctx.clone(),
             gallery: None,
             thumbs: Cache::new(gallery::CAP),
+            udid: String::new(),
         }
     }
 
@@ -77,8 +80,14 @@ impl App {
                 // Во время импорта поток шлёт только Progress/Done; состояние телефона значит, что импорт не идёт.
                 Msg::Phone(phone) => {
                     match &phone {
-                        Phone::Ready { items, .. } => {
+                        Phone::Ready { udid, items } => {
                             self.error = None;
+                            // Телефон могли сменить между опросами, и NoDevice не пришёл: пути у разных iPhone совпадают.
+                            if *udid != self.udid {
+                                self.gallery = None;
+                                self.thumbs.clear();
+                                self.udid = udid.clone();
+                            }
                             self.new = items.iter().filter(|i| !i.imported).flat_map(|i| i.files.iter().cloned()).collect();
                             self.new_sum = import::summarize(&self.new);
                             if let Some(g) = &mut self.gallery {
@@ -456,6 +465,7 @@ mod tests {
             ctx: egui::Context::default(),
             gallery: None,
             thumbs: Cache::new(gallery::CAP),
+            udid: String::new(),
         };
         (app, msg_tx, cmd_rx)
     }
@@ -490,6 +500,26 @@ mod tests {
         app.drain();
         assert!(app.gallery.is_some(), "пересканирование не закрывает галерею");
         msgs.send(Msg::Phone(Phone::NoDevice)).unwrap();
+        app.drain();
+        assert!(app.gallery.is_none());
+        assert!(!app.thumbs.contains("/A.HEIC"));
+    }
+
+    #[test]
+    fn other_phone_ready_closes_gallery_and_clears_thumbs() {
+        let (mut app, msgs, _cmds) = app();
+        let items = vec![Item { files: vec![rf("/A.HEIC", 5)], imported: false }];
+        msgs.send(ready(items.clone())).unwrap();
+        app.drain();
+        app.open_gallery();
+        app.thumbs.insert("/A.HEIC".into(), None);
+        msgs.send(Msg::Phone(Phone::Scanning)).unwrap();
+        msgs.send(ready(items.clone())).unwrap();
+        app.drain();
+        assert!(app.gallery.is_some() && app.thumbs.contains("/A.HEIC"), "тот же телефон — галерея остаётся");
+        // Телефон сменили между двумя опросами: NoDevice не приходил.
+        msgs.send(Msg::Phone(Phone::Scanning)).unwrap();
+        msgs.send(Msg::Phone(Phone::Ready { udid: "другой".into(), items })).unwrap();
         app.drain();
         assert!(app.gallery.is_none());
         assert!(!app.thumbs.contains("/A.HEIC"));
