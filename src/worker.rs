@@ -4,7 +4,7 @@ use crate::import::{self, Progress, RemoteFile, Report, Summary};
 use crate::journal::Journal;
 use eframe::egui;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -51,7 +51,10 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
                 Err(ConnectError::NoUsbmuxd) => send(Msg::NoUsbmuxd),
                 Err(ConnectError::NoDevice) => send(Msg::NoDevice),
                 Err(ConnectError::NotTrusted) => send(Msg::NotTrusted),
-                Err(ConnectError::Other(e)) => send(Msg::Error(format!("Не удалось подключиться: {e}"))),
+                Err(ConnectError::Other(e)) => {
+                    send(Msg::NoDevice);
+                    send(Msg::Error(format!("Не удалось подключиться: {e}")));
+                }
             }
         }
         if let (Some(d), None) = (dev.as_mut(), files.as_ref()) {
@@ -63,6 +66,7 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
                 }
                 Err(e) => {
                     dev = None;
+                    send(Msg::NoDevice);
                     send(Msg::Error(format!("Не удалось прочитать список файлов: {e}")));
                 }
             }
@@ -128,7 +132,6 @@ fn import_now(
     }
     let day = dest.join(chrono::Local::now().format("%Y-%m-%d").to_string());
     import::clean_parts(&day).map_err(|e| format!("Папка {}: {e}", day.display()))?;
-    cancel.store(false, Ordering::Relaxed);
     let report = import::run(&todo, &day, &mut journal, cancel, |f, out| dev.fetch(f, out), |p| {
         send(Msg::Progress(p.clone()))
     });

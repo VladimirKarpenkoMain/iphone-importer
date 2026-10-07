@@ -63,6 +63,10 @@ impl App {
 
     fn drain(&mut self) {
         while let Ok(msg) = self.msgs.try_recv() {
+            // Во время импорта поток шлёт только Progress/Done; состояние телефона значит, что импорт не идёт.
+            if matches!(msg, Msg::NoUsbmuxd | Msg::NoDevice | Msg::NotTrusted | Msg::Scanning | Msg::Ready { .. }) {
+                self.importing = None;
+            }
             match msg {
                 Msg::NoUsbmuxd => self.phone = Phone::NoUsbmuxd,
                 Msg::NoDevice => self.phone = Phone::NoDevice,
@@ -93,6 +97,7 @@ impl App {
         self.error = None;
         self.confirm_all = false;
         self.importing = Some((Progress::default(), Instant::now()));
+        self.cancel.store(false, Ordering::Relaxed);
         let _ = self.cmds.send(Cmd::Import { all });
     }
 }
@@ -255,5 +260,45 @@ fn save_dest(dest: &std::path::Path) {
     if let Some(p) = config_path() {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
         let _ = std::fs::write(p, dest.to_string_lossy().as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> (App, mpsc::Sender<Msg>, mpsc::Receiver<Cmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (msg_tx, msg_rx) = mpsc::channel();
+        let app = App {
+            dest: PathBuf::new(),
+            cmds: cmd_tx,
+            msgs: msg_rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            phone: Phone::NoDevice,
+            importing: None,
+            done: None,
+            error: None,
+            confirm_all: false,
+        };
+        (app, msg_tx, cmd_rx)
+    }
+
+    #[test]
+    fn import_click_while_phone_vanishes_does_not_stick_busy() {
+        let (mut app, msgs, _cmds) = app();
+        app.start(false);
+        msgs.send(Msg::NoDevice).unwrap();
+        app.drain();
+        assert!(app.importing.is_none());
+    }
+
+    #[test]
+    fn start_resets_cancel_before_sending_import() {
+        let (mut app, _msgs, cmds) = app();
+        app.cancel.store(true, Ordering::Relaxed);
+        app.start(false);
+        assert!(!app.cancel.load(Ordering::Relaxed));
+        assert!(matches!(cmds.try_recv(), Ok(Cmd::Import { all: false })));
     }
 }

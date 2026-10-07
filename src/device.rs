@@ -3,6 +3,7 @@ use crate::import::{FetchError, RemoteFile, kind_of};
 use idevice::afc::AfcClient;
 use idevice::afc::opcode::AfcFopenMode;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection};
+use idevice::provider::IdeviceProvider;
 use idevice::{IdeviceError, IdeviceService};
 use std::io::Write;
 use tokio::runtime::Runtime;
@@ -37,6 +38,8 @@ pub fn connect() -> Result<Device, ConnectError> {
             .find(|d| matches!(d.connection_type, Connection::Usb))
             .ok_or(ConnectError::NoDevice)?;
         let provider = dev.to_provider(UsbmuxdAddr::default(), "iphone-importer");
+        // Нет записи сопряжения (телефону ещё не нажали «Доверять») — idevice отвечает UnexpectedResponse.
+        provider.get_pairing_file().await.map_err(|_| ConnectError::NotTrusted)?;
         let afc = AfcClient::connect(&provider).await.map_err(|e| match e {
             IdeviceError::InvalidHostID | IdeviceError::DeviceLocked | IdeviceError::NotFound => {
                 ConnectError::NotTrusted
