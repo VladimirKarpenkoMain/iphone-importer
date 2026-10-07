@@ -124,6 +124,155 @@ pub fn free_space(dir: &Path) -> Option<u64> {
     (ok != 0).then_some(avail)
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Progress {
+    pub files_done: usize,
+    pub files_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub current: String,
+}
+
+#[derive(Debug)]
+pub enum FetchError {
+    /// Не удалось прочитать этот файл — пропускаем, идём дальше.
+    File(String),
+    /// Связь с телефоном потеряна — останавливаемся.
+    Connection(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Stop {
+    Cancelled,
+    ConnectionLost(String),
+    Disk(String),
+}
+
+#[derive(Debug, Default)]
+pub struct Report {
+    pub imported: usize,
+    pub total: usize,
+    pub failed: Vec<(String, String)>,
+    pub stopped: Option<Stop>,
+}
+
+/// Куда `fetch` пишет байты: файл `.part` + счётчик + прогресс + отмена.
+struct Sink<'a, F: FnMut(&Progress)> {
+    file: File,
+    progress: &'a mut Progress,
+    on_progress: &'a mut F,
+    cancel: &'a AtomicBool,
+    written: u64,
+    write_err: Option<String>,
+}
+
+impl<F: FnMut(&Progress)> Write for Sink<'_, F> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("отменено"));
+        }
+        let n = self.file.write(buf).inspect_err(|e| self.write_err = Some(e.to_string()))?;
+        self.written += n as u64;
+        self.progress.bytes_done += n as u64;
+        (self.on_progress)(self.progress);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+enum Outcome {
+    Done,
+    FileFailed(String),
+    Stop(Stop),
+}
+
+/// Копирует `files` в `day\Фото` / `day\Видео` по одному: `.part` → rename → запись в журнал.
+pub fn run(
+    files: &[RemoteFile],
+    day: &Path,
+    journal: &mut Journal,
+    cancel: &AtomicBool,
+    mut fetch: impl FnMut(&RemoteFile, &mut dyn Write) -> Result<(), FetchError>,
+    mut on_progress: impl FnMut(&Progress),
+) -> Report {
+    let mut report = Report { total: files.len(), ..Default::default() };
+    let mut progress = Progress {
+        files_total: files.len(),
+        bytes_total: files.iter().map(|f| f.size).sum(),
+        ..Default::default()
+    };
+    for f in files {
+        let Some(kind) = kind_of(&f.path) else { continue };
+        progress.current = f.name().to_string();
+        on_progress(&progress);
+        let dir = day.join(kind.folder());
+        let part = dir.join(format!("{}.part", f.name()));
+        let file = match fs::create_dir_all(&dir).and_then(|_| File::create(&part)) {
+            Ok(file) => file,
+            Err(e) => {
+                report.stopped = Some(Stop::Disk(e.to_string()));
+                break;
+            }
+        };
+        let bytes_before = progress.bytes_done;
+        let mut sink = Sink {
+            file,
+            progress: &mut progress,
+            on_progress: &mut on_progress,
+            cancel,
+            written: 0,
+            write_err: None,
+        };
+        let fetched = fetch(f, &mut sink);
+        let Sink { file, written, write_err, .. } = sink;
+        let synced = file.sync_all();
+        drop(file);
+
+        let outcome = if cancel.load(Ordering::Relaxed) {
+            Outcome::Stop(Stop::Cancelled)
+        } else if let Some(e) = write_err {
+            Outcome::Stop(Stop::Disk(e))
+        } else if let Err(e) = synced {
+            Outcome::Stop(Stop::Disk(e.to_string()))
+        } else {
+            match fetched {
+                Err(FetchError::Connection(e)) => Outcome::Stop(Stop::ConnectionLost(e)),
+                Err(FetchError::File(e)) => Outcome::FileFailed(e),
+                Ok(()) if written != f.size => {
+                    Outcome::FileFailed(format!("получено {written} байт из {}", f.size))
+                }
+                Ok(()) => Outcome::Done,
+            }
+        };
+        match outcome {
+            Outcome::Done => {
+                let target = free_path(&dir, f.name());
+                if let Err(e) = fs::rename(&part, &target).and_then(|_| journal.record(&f.path, f.size)) {
+                    let _ = fs::remove_file(&part);
+                    report.stopped = Some(Stop::Disk(e.to_string()));
+                    break;
+                }
+                report.imported += 1;
+            }
+            Outcome::FileFailed(e) => {
+                let _ = fs::remove_file(&part);
+                report.failed.push((f.path.clone(), e));
+                progress.bytes_done = bytes_before + f.size;
+            }
+            Outcome::Stop(stop) => {
+                let _ = fs::remove_file(&part);
+                report.stopped = Some(stop);
+                break;
+            }
+        }
+        progress.files_done += 1;
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +346,134 @@ mod tests {
     fn free_space_reports_something_for_temp_dir() {
         let dir = tempfile::tempdir().unwrap();
         assert!(free_space(dir.path()).unwrap() > 0);
+    }
+
+    fn ok_fetch(f: &RemoteFile, out: &mut dyn Write) -> Result<(), FetchError> {
+        out.write_all(&vec![7u8; f.size as usize]).map_err(|e| FetchError::File(e.to_string()))
+    }
+
+    #[test]
+    fn run_sorts_into_kind_folders_and_journals() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("2026-10-07");
+        let mut j = Journal::open(dest.path()).unwrap();
+        let files = [rf("/DCIM/100APPLE/A.HEIC", 3), rf("/DCIM/100APPLE/B.MOV", 4)];
+        let mut last = Progress::default();
+
+        let r = run(&files, &day, &mut j, &AtomicBool::new(false), ok_fetch, |p| last = p.clone());
+
+        assert_eq!((r.imported, r.total, r.stopped), (2, 2, None));
+        assert_eq!(names(&day.join("Фото")), vec!["A.HEIC"]);
+        assert_eq!(names(&day.join("Видео")), vec!["B.MOV"]);
+        assert_eq!(fs::read(day.join("Фото").join("A.HEIC")).unwrap(), vec![7u8; 3]);
+        assert_eq!(last.bytes_done, 7);
+        let j = Journal::open(dest.path()).unwrap();
+        assert!(j.contains("/DCIM/100APPLE/A.HEIC", 3) && j.contains("/DCIM/100APPLE/B.MOV", 4));
+    }
+
+    #[test]
+    fn run_same_name_from_two_dcim_folders_keeps_both() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("d");
+        let mut j = Journal::open(dest.path()).unwrap();
+        let files = [rf("/DCIM/100APPLE/IMG_0001.HEIC", 1), rf("/DCIM/105APPLE/IMG_0001.HEIC", 2)];
+
+        let r = run(&files, &day, &mut j, &AtomicBool::new(false), ok_fetch, |_| {});
+
+        assert_eq!(r.imported, 2);
+        assert_eq!(names(&day.join("Фото")), vec!["IMG_0001 (1).HEIC", "IMG_0001.HEIC"]);
+    }
+
+    #[test]
+    fn run_file_error_skips_file_and_continues() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("d");
+        let mut j = Journal::open(dest.path()).unwrap();
+        let files = [rf("/1/A.HEIC", 3), rf("/1/B.HEIC", 3)];
+
+        let r = run(&files, &day, &mut j, &AtomicBool::new(false), |f, out| {
+            if f.path == "/1/A.HEIC" {
+                out.write_all(b"x").unwrap();
+                return Err(FetchError::File("нет доступа".into()));
+            }
+            ok_fetch(f, out)
+        }, |_| {});
+
+        assert_eq!(r.imported, 1);
+        assert_eq!(r.failed, vec![("/1/A.HEIC".to_string(), "нет доступа".to_string())]);
+        assert_eq!(names(&day.join("Фото")), vec!["B.HEIC"]);
+        assert!(!j.contains("/1/A.HEIC", 3));
+    }
+
+    #[test]
+    fn run_size_mismatch_is_file_failure() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("d");
+        let mut j = Journal::open(dest.path()).unwrap();
+        let files = [rf("/1/A.HEIC", 10)];
+
+        let r = run(&files, &day, &mut j, &AtomicBool::new(false), |_, out| {
+            out.write_all(b"short").map_err(|e| FetchError::File(e.to_string()))
+        }, |_| {});
+
+        assert_eq!((r.imported, r.failed.len()), (0, 1));
+        assert!(names(&day.join("Фото")).is_empty());
+        assert!(!j.contains("/1/A.HEIC", 10));
+    }
+
+    #[test]
+    fn run_connection_lost_stops_and_leaves_no_part() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("d");
+        let mut j = Journal::open(dest.path()).unwrap();
+        let files = [rf("/1/A.HEIC", 3), rf("/1/B.HEIC", 3), rf("/1/C.HEIC", 3)];
+        let mut calls = 0;
+
+        let r = run(&files, &day, &mut j, &AtomicBool::new(false), |f, out| {
+            calls += 1;
+            if f.path == "/1/B.HEIC" {
+                out.write_all(b"x").unwrap();
+                return Err(FetchError::Connection("кабель".into()));
+            }
+            ok_fetch(f, out)
+        }, |_| {});
+
+        assert_eq!(r.imported, 1);
+        assert_eq!(r.stopped, Some(Stop::ConnectionLost("кабель".into())));
+        assert_eq!(calls, 2);
+        assert_eq!(names(&day.join("Фото")), vec!["A.HEIC"]);
+        let j = Journal::open(dest.path()).unwrap();
+        assert!(j.contains("/1/A.HEIC", 3) && !j.contains("/1/B.HEIC", 3));
+    }
+
+    #[test]
+    fn run_cancel_mid_file_stops_and_leaves_no_part() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("d");
+        let mut j = Journal::open(dest.path()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let files = [rf("/1/A.MOV", 3), rf("/1/B.MOV", 3)];
+
+        let r = run(&files, &day, &mut j, &cancel, |_, out| {
+            out.write_all(b"x").unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            out.write_all(b"yz").map_err(|e| FetchError::File(e.to_string()))
+        }, |_| {});
+
+        assert_eq!((r.imported, r.stopped), (0, Some(Stop::Cancelled)));
+        assert!(names(&day.join("Видео")).is_empty());
+    }
+
+    #[test]
+    fn run_unwritable_day_dir_is_disk_stop() {
+        let dest = tempfile::tempdir().unwrap();
+        let day = dest.path().join("d");
+        fs::write(&day, "это файл, а не папка").unwrap();
+        let mut j = Journal::open(dest.path()).unwrap();
+
+        let r = run(&[rf("/1/A.HEIC", 1)], &day, &mut j, &AtomicBool::new(false), ok_fetch, |_| {});
+
+        assert!(matches!(r.stopped, Some(Stop::Disk(_))));
+        assert_eq!(r.imported, 0);
     }
 }
