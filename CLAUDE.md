@@ -1,0 +1,36 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Windows-only desktop app (Rust + egui) that copies original photos/videos from an iPhone over USB into `<dest>\YYYY-MM-DD\Фото|Видео\` (date = when the import started, not EXIF date), importing only files not already recorded in a journal. Design and rationale: `docs/superpowers/specs/2026-10-07-iphone-importer-design.md`.
+
+## Build & test
+
+- Toolchain is pinned to `stable-x86_64-pc-windows-gnu` (`rust-toolchain.toml`) — no Visual Studio Build Tools. Needs MinGW (WinLibs) on PATH: `winget install BrechtSanders.WinLibs.POSIX.UCRT --scope user`. `dlltool.exe: program not found` → open a new terminal.
+- Run `cargo` from **PowerShell**, not Git Bash (there `link` resolves to GNU coreutils).
+- `cargo test` — all unit tests (no phone needed). Single test: `cargo test run_cancel_mid_file`; by module: `cargo test journal`.
+- `cargo test -- --ignored --nocapture` — hardware test in `device.rs`; needs a connected, unlocked, trusted iPhone.
+- `cargo build --release` — single `.exe`. Check it links only system DLLs: `objdump -p target\release\iphone-importer.exe | Select-String 'DLL Name'` (no `libgcc*`, `libwinpthread*`, `libstdc++*`).
+- Runtime dependency for users: Apple Devices app (Microsoft Store), which provides usbmuxd on `127.0.0.1:27015`.
+
+## Architecture
+
+Four modules, one crate:
+
+- `device.rs` — usbmuxd → first **USB** device (the phone also appears via Wi-Fi; ignored) → AFC. Wraps async `idevice` in a blocking API, each `Device` owning its own current-thread tokio `Runtime`. Lists `/DCIM/*/*`, reads files in 1 MB chunks, must explicitly `close()` AFC handles. `classify` maps fetch errors: AFC/NotFound → skip this file (`FetchError::File`), anything else → connection lost (`FetchError::Connection`). At connect time, a failed pairing-file lookup or InvalidHostID/DeviceLocked/NotFound from AFC means `NotTrusted` (so NotFound means different things at connect and at fetch).
+- `import.rs` — knows nothing about the iPhone; the byte source is the `fetch` closure, so the copy loop `run` is fully tested with fake closures. The pre-flight steps (free-space check, `clean_parts`) are called from `worker::import_now`, not from `run`.
+- `journal.rs` — `<dest>\.import-log`, one `phone_path\tsize` line per imported file, `sync_data` after each record. Identity of a file = (path on phone, size).
+- `worker.rs` — background thread: polls for the device every 2 s, rescans after each import, runs imports. Talks to GUI over `mpsc` (`Cmd` in, `Msg` out) and calls `ctx.request_repaint()` on every message. Cancel is a shared `AtomicBool`.
+- `main.rs` — egui `App`; `drain()` folds `Msg`s into UI state. Any `Msg::Phone` or `Msg::Error` clears `importing` (the worker only sends Phone states when not importing, and `import_now` can fail before the copy starts — this keeps the GUI from sticking in "busy"). `App::start` resets `cancel` to false *before* sending `Cmd::Import`; reversing that order loses a cancel. Chosen destination persists in `%APPDATA%\iphone-importer\config.txt`.
+
+### Integrity invariants (don't break these)
+
+- Copy goes to `name.part`, then `fsync` → rename to a free name → journal record. A journal line exists **only** after a successful rename: a file without a journal entry is acceptable (re-copied next time), a journal entry without a file is not.
+- Existing files are never overwritten. This relies solely on `free_path` checking `exists()` — `fs::rename` on Windows replaces the target.
+- Connection loss / cancel / disk error stop the whole run and delete the current `.part`; a per-file read error or size mismatch skips that file (not journaled) and continues. Resume is implicit via the journal; stale `.part` files in the day folder are removed before each import.
+- Copying is deliberately sequential — USB is the bottleneck.
+
+## Conventions
+
+- UI strings, comments, and doc comments are in Russian; keep it that way.
+- Out of scope by design: deleting from phone, HEIC/HEVC conversion, previews, per-file selection, Wi-Fi, WPD fallback, macOS/Linux.
