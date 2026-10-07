@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 
-/// Сторона плитки и зазор, px.
+/// Наименьшая сторона плитки и зазор, px; плитки растягиваются на всю ширину.
 const TILE: f32 = 120.0;
 const GAP: f32 = 6.0;
 
@@ -165,11 +165,13 @@ fn grid(
     thumbs: &mut Cache<Thumb>,
     cmds: &mpsc::Sender<Cmd>,
 ) {
-    let cols = (((ui.available_width() + GAP) / (TILE + GAP)).floor() as usize).max(1);
+    let width = ui.available_width();
+    let cols = (((width + GAP) / (TILE + GAP)).floor() as usize).max(1);
+    let side = ((width - GAP * (cols - 1) as f32) / cols as f32).floor();
     let rows = shown.len().div_ceil(cols);
     let mut want = vec![];
     ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
-    egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, TILE, rows, |ui, range| {
+    egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, side, rows, |ui, range| {
         for row in range {
             ui.horizontal(|ui| {
                 for &i in shown.iter().skip(row * cols).take(cols) {
@@ -179,7 +181,7 @@ fn grid(
                         want.push(key.to_string());
                     }
                     // Двойной клик даёт и два обычных — выбор переключится дважды и не изменится.
-                    let resp = tile(ui, item, g.selected.contains(key), thumbs.get(key));
+                    let resp = tile(ui, side, item, g.selected.contains(key), thumbs.get(key));
                     if resp.clicked() {
                         toggle(&mut g.selected, key);
                     }
@@ -208,15 +210,15 @@ fn with_zoom<V>(mut want: Vec<String>, g: &Gallery, thumbs: &Cache<V>) -> Vec<St
     want
 }
 
-fn tile(ui: &mut egui::Ui, item: &Item, selected: bool, thumb: Option<&Option<Thumb>>) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::click());
+fn tile(ui: &mut egui::Ui, side: f32, item: &Item, selected: bool, thumb: Option<&Option<Thumb>>) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 8.0, Color32::from_rgb(0xE5, 0xE5, 0xEA));
     let first = &item.files[0];
     match thumb {
         Some(Some(t)) => {
             let tint = if item.imported { Color32::from_gray(150) } else { Color32::WHITE };
-            p.image(t.tex.id(), rect, square_uv(t.tex.size()), tint);
+            egui::Image::new(&t.tex).uv(square_uv(t.tex.size())).tint(tint).corner_radius(8).paint_at(ui, rect);
         }
         Some(None) => {
             let ext = first.path.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_uppercase();
@@ -231,7 +233,7 @@ fn tile(ui: &mut egui::Ui, item: &Item, selected: bool, thumb: Option<&Option<Th
         badge(&p, rect.left_top() + egui::vec2(6.0, 6.0), egui::Align2::LEFT_TOP, "▶");
     }
     if item.imported {
-        badge(&p, rect.left_bottom() + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "✔ импортировано");
+        badge(&p, rect.left_bottom() + egui::vec2(6.0, -6.0), egui::Align2::LEFT_BOTTOM, "✔ есть");
     }
     let c = rect.right_top() + egui::vec2(-14.0, 14.0);
     if selected {

@@ -351,6 +351,8 @@ fn setup_style(ctx: &egui::Context) {
         v.panel_fill = BG;
         v.extreme_bg_color = Color32::from_rgb(0xE5, 0xE5, 0xEA);
         v.selection.bg_fill = BLUE;
+        // Текст выбранной кнопки («Все»/«Новые») — белый на синем.
+        v.selection.stroke.color = Color32::WHITE;
         v.hyperlink_color = BLUE;
         v.widgets.noninteractive.fg_stroke.color = TEXT;
         v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0xE5, 0xE5, 0xEA);
