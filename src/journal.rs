@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
 
-pub const FILE_NAME: &str = ".import-log";
+const FILE_NAME: &str = ".import-log";
 
 pub struct Journal {
     seen: HashSet<(String, u64)>,

@@ -117,7 +117,8 @@ pub fn free_space(dir: &Path) -> Option<u64> {
     unsafe extern "system" {
         fn GetDiskFreeSpaceExW(dir: *const u16, avail: *mut u64, total: *mut u64, free: *mut u64) -> i32;
     }
-    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    // Завершающий `\` обязателен для UNC-корня (`\\server\share\`), обычным путям не мешает.
+    let wide: Vec<u16> = dir.join("").as_os_str().encode_wide().chain([0]).collect();
     let mut avail = 0u64;
     // SAFETY: `wide` оканчивается нулём; null для ненужных выходов API допускает.
     let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -162,7 +163,6 @@ struct Sink<'a, F: FnMut(&Progress)> {
     progress: &'a mut Progress,
     on_progress: &'a mut F,
     cancel: &'a AtomicBool,
-    written: u64,
     write_err: Option<String>,
 }
 
@@ -172,7 +172,6 @@ impl<F: FnMut(&Progress)> Write for Sink<'_, F> {
             return Err(io::Error::other("отменено"));
         }
         let n = self.file.write(buf).inspect_err(|e| self.write_err = Some(e.to_string()))?;
-        self.written += n as u64;
         self.progress.bytes_done += n as u64;
         (self.on_progress)(self.progress);
         Ok(n)
@@ -223,11 +222,11 @@ pub fn run(
             progress: &mut progress,
             on_progress: &mut on_progress,
             cancel,
-            written: 0,
             write_err: None,
         };
         let fetched = fetch(f, &mut sink);
-        let Sink { file, written, write_err, .. } = sink;
+        let Sink { file, write_err, .. } = sink;
+        let written = progress.bytes_done - bytes_before;
         let synced = file.sync_all();
         drop(file);
 

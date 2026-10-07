@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 idevice = { version = "0.1.68", default-features = false, features = ["rustcrypto", "usbmuxd", "afc"] }
-tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio = { version = "1", features = ["rt"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 eframe = "0.36"
 rfd = "0.17"

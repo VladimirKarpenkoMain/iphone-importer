@@ -59,7 +59,8 @@ impl Device {
             let mut out = vec![];
             for d in afc.list_dir("/DCIM").await? {
                 let dir = format!("/DCIM/{d}");
-                if d.starts_with('.') || afc.get_file_info(&dir).await?.st_ifmt != "S_IFDIR" {
+                // Нечитаемую запись пропускаем, чтобы она не блокировала весь список.
+                if d.starts_with('.') || afc.get_file_info(&dir).await.map_or(true, |i| i.st_ifmt != "S_IFDIR") {
                     continue;
                 }
                 for name in afc.list_dir(&dir).await? {
@@ -67,7 +68,7 @@ impl Device {
                         continue;
                     }
                     let path = format!("{dir}/{name}");
-                    let info = afc.get_file_info(&path).await?;
+                    let Ok(info) = afc.get_file_info(&path).await else { continue };
                     if info.st_ifmt == "S_IFREG" {
                         out.push(RemoteFile { path, size: info.size as u64 });
                     }

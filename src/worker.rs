@@ -13,12 +13,17 @@ pub enum Cmd {
     Import { all: bool },
 }
 
-pub enum Msg {
+/// Что показывать про телефон.
+pub enum Phone {
     NoUsbmuxd,
     NoDevice,
     NotTrusted,
     Scanning,
     Ready { udid: String, new: Summary, all: Summary },
+}
+
+pub enum Msg {
+    Phone(Phone),
     Progress(Progress),
     Done { report: Report, day: PathBuf },
     Error(String),
@@ -48,17 +53,17 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
             files = None;
             match device::connect() {
                 Ok(d) => dev = Some(d),
-                Err(ConnectError::NoUsbmuxd) => send(Msg::NoUsbmuxd),
-                Err(ConnectError::NoDevice) => send(Msg::NoDevice),
-                Err(ConnectError::NotTrusted) => send(Msg::NotTrusted),
+                Err(ConnectError::NoUsbmuxd) => send(Msg::Phone(Phone::NoUsbmuxd)),
+                Err(ConnectError::NoDevice) => send(Msg::Phone(Phone::NoDevice)),
+                Err(ConnectError::NotTrusted) => send(Msg::Phone(Phone::NotTrusted)),
                 Err(ConnectError::Other(e)) => {
-                    send(Msg::NoDevice);
+                    send(Msg::Phone(Phone::NoDevice));
                     send(Msg::Error(format!("Не удалось подключиться: {e}")));
                 }
             }
         }
         if let (Some(d), None) = (dev.as_mut(), files.as_ref()) {
-            send(Msg::Scanning);
+            send(Msg::Phone(Phone::Scanning));
             match d.list() {
                 Ok(list) => {
                     send(ready(&d.udid, &list, &dest));
@@ -66,7 +71,7 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
                 }
                 Err(e) => {
                     dev = None;
-                    send(Msg::NoDevice);
+                    send(Msg::Phone(Phone::NoDevice));
                     send(Msg::Error(format!("Не удалось прочитать список файлов: {e}")));
                 }
             }
@@ -86,9 +91,9 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
                         send(Msg::Done { report, day });
                         if lost {
                             dev = None;
-                        } else {
-                            send(ready(&d.udid, list, &dest));
                         }
+                        // Пересчитать заново: на телефоне могли появиться новые снимки.
+                        files = None;
                     }
                     Err(e) => send(Msg::Error(e)),
                 }
@@ -101,11 +106,11 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
 
 fn ready(udid: &str, files: &[RemoteFile], dest: &Path) -> Msg {
     match Journal::open(dest) {
-        Ok(j) => Msg::Ready {
+        Ok(j) => Msg::Phone(Phone::Ready {
             udid: udid.to_string(),
             new: import::summarize(&import::select(files, &j, false)),
             all: import::summarize(&import::select(files, &j, true)),
-        },
+        }),
         Err(e) => Msg::Error(format!("Папка {}: {e}", dest.display())),
     }
 }

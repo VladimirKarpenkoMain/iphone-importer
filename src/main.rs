@@ -6,12 +6,12 @@ mod journal;
 mod worker;
 
 use eframe::egui;
-use import::{Progress, Report, Stop, Summary};
+use import::{Progress, Report, Stop};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Instant;
-use worker::{Cmd, Msg};
+use worker::{Cmd, Msg, Phone};
 
 const STORE_URL: &str = "ms-windows-store://pdp/?productid=9NP83LWLPZ9K";
 
@@ -21,14 +21,6 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("iPhone Importer", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
-}
-
-enum Phone {
-    NoUsbmuxd,
-    NoDevice,
-    NotTrusted,
-    Scanning,
-    Ready { udid: String, new: Summary, all: Summary },
 }
 
 struct App {
@@ -63,18 +55,14 @@ impl App {
 
     fn drain(&mut self) {
         while let Ok(msg) = self.msgs.try_recv() {
-            // Во время импорта поток шлёт только Progress/Done; состояние телефона значит, что импорт не идёт.
-            if matches!(msg, Msg::NoUsbmuxd | Msg::NoDevice | Msg::NotTrusted | Msg::Scanning | Msg::Ready { .. }) {
-                self.importing = None;
-            }
             match msg {
-                Msg::NoUsbmuxd => self.phone = Phone::NoUsbmuxd,
-                Msg::NoDevice => self.phone = Phone::NoDevice,
-                Msg::NotTrusted => self.phone = Phone::NotTrusted,
-                Msg::Scanning => self.phone = Phone::Scanning,
-                Msg::Ready { udid, new, all } => {
-                    self.phone = Phone::Ready { udid, new, all };
-                    self.error = None;
+                // Во время импорта поток шлёт только Progress/Done; состояние телефона значит, что импорт не идёт.
+                Msg::Phone(phone) => {
+                    if matches!(phone, Phone::Ready { .. }) {
+                        self.error = None;
+                    }
+                    self.importing = None;
+                    self.phone = phone;
                 }
                 Msg::Progress(p) => {
                     let started = self.importing.as_ref().map_or_else(Instant::now, |(_, t)| *t);
@@ -149,20 +137,20 @@ impl eframe::App for App {
 
             if let Phone::Ready { new, all, .. } = &self.phone {
                 let (new, all) = (*new, *all);
-                if new.photos + new.videos == 0 {
+                let n = new.photos + new.videos;
+                if n == 0 {
                     ui.label("Всё уже импортировано.");
                 } else {
                     ui.label(format!(
                         "Новых: {} файлов — {} фото, {} видео, {}",
-                        new.photos + new.videos,
+                        n,
                         new.photos,
                         new.videos,
                         size(new.bytes)
                     ));
                 }
                 ui.horizontal(|ui| {
-                    let has_new = new.photos + new.videos > 0;
-                    if ui.add_enabled(!busy && has_new, egui::Button::new("Импортировать")).clicked() {
+                    if ui.add_enabled(!busy && n > 0, egui::Button::new("Импортировать")).clicked() {
                         self.start(false);
                     }
                     if ui.add_enabled(!busy, egui::Button::new("Всё заново…")).clicked() {
@@ -187,7 +175,7 @@ impl eframe::App for App {
                 ui.add(egui::ProgressBar::new(frac).show_percentage());
                 let secs = started.elapsed().as_secs_f64().max(0.001);
                 let speed = p.bytes_done as f64 / secs;
-                let eta = if speed > 0.0 { (p.bytes_total - p.bytes_done) as f64 / speed } else { 0.0 };
+                let eta = if speed > 0.0 { p.bytes_total.saturating_sub(p.bytes_done) as f64 / speed } else { 0.0 };
                 ui.label(format!(
                     "{} / {} · {:.1} МБ/с · осталось ~{}:{:02} · {}",
                     p.files_done,
@@ -288,7 +276,7 @@ mod tests {
     fn import_click_while_phone_vanishes_does_not_stick_busy() {
         let (mut app, msgs, _cmds) = app();
         app.start(false);
-        msgs.send(Msg::NoDevice).unwrap();
+        msgs.send(Msg::Phone(Phone::NoDevice)).unwrap();
         app.drain();
         assert!(app.importing.is_none());
     }
