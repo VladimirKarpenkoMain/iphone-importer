@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod device;
+mod gallery;
 mod import;
 mod journal;
 mod worker;
