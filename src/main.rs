@@ -32,8 +32,7 @@ struct App {
     msgs: mpsc::Receiver<Msg>,
     cancel: Arc<AtomicBool>,
     phone: Phone,
-    /// Файлы неимпортированных плиток (главная кнопка) и их сводка.
-    new: Vec<RemoteFile>,
+    /// Сводка неимпортированных плиток (главная кнопка).
     new_sum: Summary,
     importing: Option<(Progress, Instant)>,
     /// Текст «скорость · осталось» и когда он посчитан: обновляется раз в секунду, иначе цифры мельтешат.
@@ -61,7 +60,6 @@ impl App {
             msgs,
             cancel,
             phone: Phone::NoDevice,
-            new: vec![],
             new_sum: Summary::default(),
             importing: None,
             rate: (Instant::now(), String::new()),
@@ -88,8 +86,7 @@ impl App {
                                 self.thumbs.clear();
                                 self.udid = udid.clone();
                             }
-                            self.new = items.iter().filter(|i| !i.imported).flat_map(|i| i.files.iter().cloned()).collect();
-                            self.new_sum = import::summarize(&self.new);
+                            self.new_sum = import::summarize(&Gallery::new(items).files(items));
                             if let Some(g) = &mut self.gallery {
                                 g.retain(items);
                             }
@@ -160,11 +157,7 @@ impl eframe::App for App {
         let panel = egui::Frame::new().fill(BG).inner_margin(24);
         egui::CentralPanel::default().frame(panel).show(ui, |ui| {
             if let (Some(g), Phone::Ready { items, .. }) = (self.gallery.as_mut(), &self.phone) {
-                let cmds = &self.cmds;
-                let action = gallery::show(ui, g, items, &mut self.thumbs, &mut |keys| {
-                    let _ = cmds.send(Cmd::Thumbs(keys));
-                });
-                match action {
+                match gallery::show(ui, g, items, &mut self.thumbs, &self.cmds) {
                     Action::Back => self.gallery = None,
                     Action::Import => self.import_selected(),
                     Action::None => {}
@@ -301,11 +294,14 @@ impl eframe::App for App {
             });
 
             if matches!(self.phone, Phone::Ready { .. }) {
-                let n = self.new.len();
+                let n = self.new_sum.photos + self.new_sum.videos;
                 let label = if n == 0 { "Импортировать".to_string() } else { format!("Импортировать {n} файлов") };
                 let button = primary(label).min_size(egui::vec2(ui.available_width(), 38.0));
-                if ui.add_enabled(!busy && n > 0, button).clicked() {
-                    self.start(self.new.clone());
+                if ui.add_enabled(!busy && n > 0, button).clicked()
+                    && let Phone::Ready { items, .. } = &self.phone
+                {
+                    let files = Gallery::new(items).files(items);
+                    self.start(files);
                 }
                 ui.vertical_centered(|ui| {
                     let link = egui::Button::new(RichText::new("Выбрать файлы…").color(BLUE)).frame(false);
@@ -456,7 +452,6 @@ mod tests {
             msgs: msg_rx,
             cancel: Arc::new(AtomicBool::new(false)),
             phone: Phone::NoDevice,
-            new: vec![],
             new_sum: Summary::default(),
             importing: None,
             rate: (Instant::now(), String::new()),
@@ -562,7 +557,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_collects_files_of_new_items() {
+    fn ready_summarizes_new_items() {
         let (mut app, msgs, _cmds) = app();
         let items = vec![
             Item { files: vec![rf("/A.HEIC", 5), rf("/A.MOV", 2)], imported: false },
@@ -570,7 +565,6 @@ mod tests {
         ];
         msgs.send(Msg::Phone(Phone::Ready { udid: "u".into(), items })).unwrap();
         app.drain();
-        assert_eq!(app.new, vec![rf("/A.HEIC", 5), rf("/A.MOV", 2)]);
         assert_eq!(app.new_sum, Summary { photos: 1, videos: 1, bytes: 7 });
     }
 }

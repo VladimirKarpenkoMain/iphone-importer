@@ -51,7 +51,6 @@ pub fn spawn(dest: PathBuf, ctx: egui::Context, cancel: Arc<AtomicBool>) -> (mps
     (cmd_tx, msg_rx)
 }
 
-
 fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel: &AtomicBool) {
     let mut dev: Option<Device> = None;
     let mut files: Option<Vec<RemoteFile>> = None;
@@ -96,15 +95,7 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
             thumbs.clear();
         }
         // Пока есть миниатюры в очереди, команды не ждём.
-        let cmd = if thumbs.is_empty() {
-            cmds.recv_timeout(POLL)
-        } else {
-            cmds.try_recv().map_err(|e| match e {
-                mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
-                mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
-            })
-        };
-        match cmd {
+        match cmds.recv_timeout(if thumbs.is_empty() { POLL } else { Duration::ZERO }) {
             Ok(Cmd::SetDest(p)) => {
                 dest = p;
                 if let (Some(d), Some(list)) = (dev.as_ref(), files.as_ref()) {
@@ -133,8 +124,14 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
         if let (Some(d), Some(path)) = (dev.as_mut(), thumbs.pop_front()) {
-            let jpeg = d.thumbnail(&path);
-            send(Msg::Thumb { path, jpeg });
+            match d.thumbnail(&path) {
+                Ok(jpeg) => send(Msg::Thumb { path, jpeg }),
+                // Связь потеряна — переподключиться сразу; после пересканирования GUI запросит миниатюры заново.
+                Err(_) => {
+                    dev = None;
+                    polled = None;
+                }
+            }
         }
     }
 }

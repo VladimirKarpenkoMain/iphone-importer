@@ -101,18 +101,23 @@ impl Device {
         })
     }
 
-    /// Готовая JPEG-миниатюра iOS (~360×480) для файла `path` или `None`, если её нет или не прочиталась.
-    /// Пропажу телефона здесь не различаем — её ловит `still_connected`.
-    pub fn thumbnail(&mut self, path: &str) -> Option<Vec<u8>> {
+    /// Готовая JPEG-миниатюра iOS (~360×480) для файла `path`; `Ok(None)` — её нет (ошибка AFC про файл).
+    /// Ошибки как в `fetch`: остальное — связь потеряна, AFC-клиент после неё не используем.
+    pub fn thumbnail(&mut self, path: &str) -> Result<Option<Vec<u8>>, FetchError> {
         let Device { rt, afc, .. } = self;
-        rt.block_on(async {
+        let read = rt.block_on(async {
             let thumb = format!("/PhotoData/Thumbnails/V2{path}/5005.JPG");
-            let size = afc.get_file_info(&thumb).await.ok()?.size;
-            let mut fd = afc.open(thumb.as_str(), AfcFopenMode::RdOnly).await.ok()?;
+            let size = afc.get_file_info(&thumb).await?.size;
+            let mut fd = afc.open(thumb.as_str(), AfcFopenMode::RdOnly).await?;
             let data = fd.read_n(size as usize).await;
-            let _ = fd.close().await;
-            data.ok()
-        })
+            let closed = fd.close().await;
+            closed.and(data)
+        });
+        match read.map_err(classify) {
+            Ok(data) => Ok(Some(data)),
+            Err(FetchError::File(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Телефон всё ещё виден usbmuxd по USB.
@@ -161,9 +166,9 @@ mod tests {
         let mut dev = connect().expect("connect");
         let files = dev.list().expect("list");
         let photo = files.iter().find(|f| crate::import::kind_of(&f.path) == Some(crate::import::Kind::Photo)).expect("нет фото");
-        let jpeg = dev.thumbnail(&photo.path).expect("нет миниатюры");
+        let jpeg = dev.thumbnail(&photo.path).expect("связь").expect("нет миниатюры");
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
-        assert!(dev.thumbnail("/DCIM/нет/такого.HEIC").is_none());
+        assert!(dev.thumbnail("/DCIM/нет/такого.HEIC").expect("связь").is_none());
         println!("{}: миниатюра {} байт", photo.path, jpeg.len());
     }
 }

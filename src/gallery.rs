@@ -1,8 +1,10 @@
 //! Экран галереи: плитки с миниатюрами iOS, выбор файлов, увеличение.
-use crate::import::{Item, Kind, RemoteFile, kind_of};
+use crate::import::{self, Item, Kind, RemoteFile, kind_of};
+use crate::worker::Cmd;
 use crate::{BLUE, GRAY, primary, secondary, size};
 use eframe::egui::{self, Color32};
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 
 /// Сторона плитки и зазор, px.
 const TILE: f32 = 120.0;
@@ -77,10 +79,12 @@ impl Gallery {
         }
     }
 
-    /// После пересканирования: выбор только среди плиток, которые ещё есть.
+    /// После пересканирования: выбор только среди плиток, которые ещё есть; миниатюры запросить заново
+    /// (worker мог переподключиться и потерять очередь).
     pub fn retain(&mut self, items: &[Item]) {
         let keys: HashSet<&str> = items.iter().map(Item::key).collect();
         self.selected.retain(|k| keys.contains(k.as_str()));
+        self.sent.clear();
     }
 
     /// Индексы плиток, видимых при текущем фильтре.
@@ -116,14 +120,8 @@ pub enum Action {
     Import,
 }
 
-/// Экран галереи. `request` получает ключи видимых плиток без миниатюры (только когда набор изменился).
-pub fn show(
-    ui: &mut egui::Ui,
-    g: &mut Gallery,
-    items: &[Item],
-    thumbs: &mut Cache<Thumb>,
-    request: &mut dyn FnMut(Vec<String>),
-) -> Action {
+/// Экран галереи. Ключи видимых плиток без миниатюры уходят в `cmds` (только когда набор изменился).
+pub fn show(ui: &mut egui::Ui, g: &mut Gallery, items: &[Item], thumbs: &mut Cache<Thumb>, cmds: &mpsc::Sender<Cmd>) -> Action {
     let mut action = Action::None;
     let shown = g.shown(items);
     ui.horizontal(|ui| {
@@ -145,18 +143,15 @@ pub fn show(
             }
         });
     });
-    let (mut count, mut bytes) = (0, 0u64);
-    for f in items.iter().filter(|i| g.selected.contains(i.key())).flat_map(|i| &i.files) {
-        count += 1;
-        bytes += f.size;
-    }
+    let sum = import::summarize(&g.files(items));
+    let (count, bytes) = (sum.photos + sum.videos, sum.bytes);
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         let button = primary(format!("Импортировать {count}")).min_size(egui::vec2(ui.available_width(), 38.0));
         if ui.add_enabled(count > 0, button).clicked() {
             action = Action::Import;
         }
         ui.label(secondary(format!("Выбрано {count} · {}", size(bytes))));
-        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| grid(ui, g, items, &shown, thumbs, request));
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| grid(ui, g, items, &shown, thumbs, cmds));
     });
     zoom(ui, g, items, &shown, thumbs);
     action
@@ -168,7 +163,7 @@ fn grid(
     items: &[Item],
     shown: &[usize],
     thumbs: &mut Cache<Thumb>,
-    request: &mut dyn FnMut(Vec<String>),
+    cmds: &mpsc::Sender<Cmd>,
 ) {
     let cols = (((ui.available_width() + GAP) / (TILE + GAP)).floor() as usize).max(1);
     let rows = shown.len().div_ceil(cols);
@@ -197,7 +192,7 @@ fn grid(
     });
     let want = with_zoom(want, g, thumbs);
     if !want.is_empty() && want != g.sent {
-        request(want.clone());
+        let _ = cmds.send(Cmd::Thumbs(want.clone()));
         g.sent = want;
     }
 }
@@ -308,7 +303,11 @@ fn zoom(ui: &mut egui::Ui, g: &mut Gallery, items: &[Item], shown: &[usize], thu
         ui.label(secondary(format!("{state} — Пробел, ←/→ — соседние, Esc — закрыть")));
     });
     let (left, right, space) = ui.input(|i| {
-        (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), i.key_pressed(egui::Key::Space))
+        // Пробел без автоповтора: удержание не должно щёлкать выбором туда-обратно.
+        let space = i.events.iter().any(|e| {
+            matches!(e, egui::Event::Key { key: egui::Key::Space, pressed: true, repeat: false, .. })
+        });
+        (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight), space)
     });
     if space {
         toggle(&mut g.selected, &key);
@@ -362,10 +361,12 @@ mod tests {
     fn gallery_retain_drops_vanished_items() {
         let mut items = items();
         let mut g = Gallery::new(&items);
+        g.sent = vec!["/C.MOV".into()];
         items.remove(0);
         g.retain(&items);
         assert_eq!(g.files(&items), vec![rf("/C.MOV", 9)]);
         assert!(!g.selected.contains("/A.HEIC"));
+        assert!(g.sent.is_empty(), "после пересканирования миниатюры запрашиваются заново");
     }
 
     #[test]
