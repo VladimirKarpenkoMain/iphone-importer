@@ -101,6 +101,20 @@ impl Device {
         })
     }
 
+    /// Готовая JPEG-миниатюра iOS (~360×480) для файла `path` или `None`, если её нет или не прочиталась.
+    /// Пропажу телефона здесь не различаем — её ловит `still_connected`.
+    pub fn thumbnail(&mut self, path: &str) -> Option<Vec<u8>> {
+        let Device { rt, afc, .. } = self;
+        rt.block_on(async {
+            let thumb = format!("/PhotoData/Thumbnails/V2{path}/5005.JPG");
+            let size = afc.get_file_info(&thumb).await.ok()?.size;
+            let mut fd = afc.open(thumb.as_str(), AfcFopenMode::RdOnly).await.ok()?;
+            let data = fd.read_n(size as usize).await;
+            let _ = fd.close().await;
+            data.ok()
+        })
+    }
+
     /// Телефон всё ещё виден usbmuxd по USB.
     pub fn still_connected(&self) -> bool {
         self.rt.block_on(async {
@@ -138,5 +152,18 @@ mod tests {
         assert_eq!(buf.len() as u64, small.size);
         assert!(dev.still_connected());
         println!("{} файлов, прочитан {} ({} байт)", files.len(), small.path, small.size);
+    }
+
+    /// Нужен подключённый и доверенный iPhone: `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn reads_thumbnail_from_real_iphone() {
+        let mut dev = connect().expect("connect");
+        let files = dev.list().expect("list");
+        let photo = files.iter().find(|f| crate::import::kind_of(&f.path) == Some(crate::import::Kind::Photo)).expect("нет фото");
+        let jpeg = dev.thumbnail(&photo.path).expect("нет миниатюры");
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        assert!(dev.thumbnail("/DCIM/нет/такого.HEIC").is_none());
+        println!("{}: миниатюра {} байт", photo.path, jpeg.len());
     }
 }
