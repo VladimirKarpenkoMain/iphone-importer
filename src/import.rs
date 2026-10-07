@@ -1,6 +1,7 @@
 //! Раскладка по папкам, отбор новых и копирование. Про iPhone ничего не знает:
 //! источник байтов передаётся замыканием `fetch`.
 use crate::journal::Journal;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -74,6 +75,53 @@ pub fn summarize(files: &[RemoteFile]) -> Summary {
         s.bytes += f.size;
     }
     s
+}
+
+/// Плитка галереи: один файл или пара Live Photo (фото первым).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Item {
+    pub files: Vec<RemoteFile>,
+    /// Все файлы плитки есть в журнале.
+    pub imported: bool,
+}
+
+impl Item {
+    /// Ключ плитки; по нему же берётся миниатюра.
+    pub fn key(&self) -> &str {
+        &self.files[0].path
+    }
+}
+
+/// Фото и видео из `files` плитками по порядку путей. Live Photo — фото и `.MOV` с тем же путём
+/// без расширения — одна плитка.
+pub fn group(files: &[RemoteFile], journal: &Journal) -> Vec<Item> {
+    let stem = |p: &str| p.rsplit_once('.').map_or(p, |(s, _)| s).to_ascii_lowercase();
+    let is_mov = |p: &str| p.rsplit_once('.').is_some_and(|(_, e)| e.eq_ignore_ascii_case("mov"));
+    let mut media: Vec<&RemoteFile> = files.iter().filter(|f| kind_of(&f.path).is_some()).collect();
+    media.sort_by(|a, b| a.path.cmp(&b.path));
+    let photos: HashSet<String> =
+        media.iter().filter(|f| kind_of(&f.path) == Some(Kind::Photo)).map(|f| stem(&f.path)).collect();
+
+    let mut items = vec![];
+    let mut photo_at = HashMap::new();
+    let mut live = vec![];
+    for f in media {
+        if is_mov(&f.path) && photos.contains(&stem(&f.path)) {
+            live.push(f);
+            continue;
+        }
+        if kind_of(&f.path) == Some(Kind::Photo) {
+            photo_at.insert(stem(&f.path), items.len());
+        }
+        items.push(Item { files: vec![f.clone()], imported: false });
+    }
+    for f in live {
+        items[photo_at[&stem(&f.path)]].files.push(f.clone());
+    }
+    for item in &mut items {
+        item.imported = item.files.iter().all(|f| journal.contains(&f.path, f.size));
+    }
+    items
 }
 
 /// `dir\name`, а если занято — `dir\stem (n).ext` с наименьшим свободным n.
@@ -308,6 +356,54 @@ mod tests {
 
         assert_eq!(select(&files, &j, false), vec![rf("/DCIM/1/B.MOV", 9)]);
         assert_eq!(select(&files, &j, true), vec![rf("/DCIM/1/A.HEIC", 5), rf("/DCIM/1/B.MOV", 9)]);
+    }
+
+    fn paths(items: &[Item]) -> Vec<Vec<&str>> {
+        items.iter().map(|i| i.files.iter().map(|f| f.path.as_str()).collect()).collect()
+    }
+
+    #[test]
+    fn group_pairs_live_photos_and_sorts_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path()).unwrap();
+        let files = [
+            rf("/DCIM/1/B.MOV", 9),
+            rf("/DCIM/1/A.MOV", 2),
+            rf("/DCIM/1/A.heic", 5),
+            rf("/DCIM/1/C.JPG", 3),
+            rf("/DCIM/1/A.AAE", 1),
+        ];
+        assert_eq!(
+            paths(&group(&files, &j)),
+            vec![vec!["/DCIM/1/A.heic", "/DCIM/1/A.MOV"], vec!["/DCIM/1/B.MOV"], vec!["/DCIM/1/C.JPG"]]
+        );
+    }
+
+    #[test]
+    fn group_does_not_pair_across_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path()).unwrap();
+        let files = [rf("/DCIM/100APPLE/IMG_1.HEIC", 5), rf("/DCIM/101APPLE/IMG_1.MOV", 2)];
+        assert_eq!(
+            paths(&group(&files, &j)),
+            vec![vec!["/DCIM/100APPLE/IMG_1.HEIC"], vec!["/DCIM/101APPLE/IMG_1.MOV"]]
+        );
+    }
+
+    #[test]
+    fn group_item_is_imported_only_when_all_files_journaled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = Journal::open(dir.path()).unwrap();
+        j.record("/1/A.HEIC", 5).unwrap();
+        j.record("/1/C.JPG", 3).unwrap();
+        let files = [rf("/1/A.HEIC", 5), rf("/1/A.MOV", 2), rf("/1/C.JPG", 3)];
+
+        let g = group(&files, &j);
+        assert_eq!(g.iter().map(|i| i.imported).collect::<Vec<_>>(), vec![false, true]);
+        assert_eq!(g[0].key(), "/1/A.HEIC");
+
+        j.record("/1/A.MOV", 2).unwrap();
+        assert!(group(&files, &j)[0].imported);
     }
 
     #[test]
