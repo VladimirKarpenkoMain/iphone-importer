@@ -109,5 +109,6 @@
 
 ## Вне объёма
 
-Удаление с телефона, конвертация HEIC/HEVC, превью, выбор отдельных файлов, Wi-Fi,
-WPD-режим без Apple Devices, macOS/Linux.
+Удаление с телефона, конвертация HEIC/HEVC, Wi-Fi,
+WPD-режим без Apple Devices, macOS/Linux. (Превью и выбор файлов — см.
+`2026-10-07-gallery-selection-design.md`.)
