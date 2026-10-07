@@ -8,7 +8,7 @@ mod worker;
 
 use eframe::egui;
 use egui::{Color32, FontFamily, RichText};
-use import::{Progress, Report, Stop};
+use import::{Progress, RemoteFile, Report, Stop, Summary};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -31,12 +31,14 @@ struct App {
     msgs: mpsc::Receiver<Msg>,
     cancel: Arc<AtomicBool>,
     phone: Phone,
+    /// Файлы неимпортированных плиток (главная кнопка) и их сводка.
+    new: Vec<RemoteFile>,
+    new_sum: Summary,
     importing: Option<(Progress, Instant)>,
     /// Текст «скорость · осталось» и когда он посчитан: обновляется раз в секунду, иначе цифры мельтешат.
     rate: (Instant, String),
     done: Option<(Report, PathBuf)>,
     error: Option<String>,
-    confirm_all: bool,
 }
 
 impl App {
@@ -51,11 +53,12 @@ impl App {
             msgs,
             cancel,
             phone: Phone::NoDevice,
+            new: vec![],
+            new_sum: Summary::default(),
             importing: None,
             rate: (Instant::now(), String::new()),
             done: None,
             error: None,
-            confirm_all: false,
         }
     }
 
@@ -64,8 +67,10 @@ impl App {
             match msg {
                 // Во время импорта поток шлёт только Progress/Done; состояние телефона значит, что импорт не идёт.
                 Msg::Phone(phone) => {
-                    if matches!(phone, Phone::Ready { .. }) {
+                    if let Phone::Ready { items, .. } = &phone {
                         self.error = None;
+                        self.new = items.iter().filter(|i| !i.imported).flat_map(|i| i.files.iter().cloned()).collect();
+                        self.new_sum = import::summarize(&self.new);
                     }
                     self.importing = None;
                     self.phone = phone;
@@ -82,18 +87,18 @@ impl App {
                     self.importing = None;
                     self.error = Some(e);
                 }
+                Msg::Thumb { .. } => {}
             }
         }
     }
 
-    fn start(&mut self, all: bool) {
+    fn start(&mut self, files: Vec<RemoteFile>) {
         self.done = None;
         self.error = None;
-        self.confirm_all = false;
         self.importing = Some((Progress::default(), Instant::now()));
         self.rate.1.clear();
         self.cancel.store(false, Ordering::Relaxed);
-        let _ = self.cmds.send(Cmd::Import { all });
+        let _ = self.cmds.send(Cmd::Import(files));
     }
 }
 
@@ -135,7 +140,8 @@ impl eframe::App for App {
                 if matches!(self.phone, Phone::NoUsbmuxd) && ui.add(primary("Открыть в Microsoft Store")).clicked() {
                     let _ = std::process::Command::new("explorer").arg(STORE_URL).spawn();
                 }
-                if let Phone::Ready { new, .. } = &self.phone {
+                if matches!(self.phone, Phone::Ready { .. }) {
+                    let new = self.new_sum;
                     ui.separator();
                     if new.photos + new.videos == 0 {
                         ui.label(secondary("Всё уже импортировано."));
@@ -230,32 +236,12 @@ impl eframe::App for App {
                 });
             });
 
-            if let Phone::Ready { new, all, .. } = &self.phone {
-                let (n, all) = (new.photos + new.videos, *all);
-                if self.confirm_all && !busy {
-                    card(ui, |ui| {
-                        ui.label(format!("Скопировать все {} файлов ({}) ещё раз?", all.photos + all.videos, size(all.bytes)));
-                        ui.horizontal(|ui| {
-                            if ui.add(primary("Скопировать")).clicked() {
-                                self.start(true);
-                            }
-                            if ui.button("Отмена").clicked() {
-                                self.confirm_all = false;
-                            }
-                        });
-                    });
-                } else {
-                    let label = if n == 0 { "Импортировать".to_string() } else { format!("Импортировать {n} файлов") };
-                    let button = primary(label).min_size(egui::vec2(ui.available_width(), 38.0));
-                    if ui.add_enabled(!busy && n > 0, button).clicked() {
-                        self.start(false);
-                    }
-                    ui.vertical_centered(|ui| {
-                        let link = egui::Button::new(RichText::new("Скопировать всё заново…").color(BLUE)).frame(false);
-                        if ui.add_enabled(!busy, link).clicked() {
-                            self.confirm_all = true;
-                        }
-                    });
+            if matches!(self.phone, Phone::Ready { .. }) {
+                let n = self.new.len();
+                let label = if n == 0 { "Импортировать".to_string() } else { format!("Импортировать {n} файлов") };
+                let button = primary(label).min_size(egui::vec2(ui.available_width(), 38.0));
+                if ui.add_enabled(!busy && n > 0, button).clicked() {
+                    self.start(self.new.clone());
                 }
             }
         });
@@ -385,6 +371,11 @@ fn save_dest(dest: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use import::{Item, RemoteFile, Summary};
+
+    fn rf(path: &str, size: u64) -> RemoteFile {
+        RemoteFile { path: path.into(), size }
+    }
 
     fn app() -> (App, mpsc::Sender<Msg>, mpsc::Receiver<Cmd>) {
         let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -395,11 +386,12 @@ mod tests {
             msgs: msg_rx,
             cancel: Arc::new(AtomicBool::new(false)),
             phone: Phone::NoDevice,
+            new: vec![],
+            new_sum: Summary::default(),
             importing: None,
             rate: (Instant::now(), String::new()),
             done: None,
             error: None,
-            confirm_all: false,
         };
         (app, msg_tx, cmd_rx)
     }
@@ -407,7 +399,7 @@ mod tests {
     #[test]
     fn import_click_while_phone_vanishes_does_not_stick_busy() {
         let (mut app, msgs, _cmds) = app();
-        app.start(false);
+        app.start(vec![rf("/A.HEIC", 1)]);
         msgs.send(Msg::Phone(Phone::NoDevice)).unwrap();
         app.drain();
         assert!(app.importing.is_none());
@@ -417,8 +409,21 @@ mod tests {
     fn start_resets_cancel_before_sending_import() {
         let (mut app, _msgs, cmds) = app();
         app.cancel.store(true, Ordering::Relaxed);
-        app.start(false);
+        app.start(vec![rf("/A.HEIC", 1)]);
         assert!(!app.cancel.load(Ordering::Relaxed));
-        assert!(matches!(cmds.try_recv(), Ok(Cmd::Import { all: false })));
+        assert!(matches!(cmds.try_recv(), Ok(Cmd::Import(f)) if f == vec![rf("/A.HEIC", 1)]));
+    }
+
+    #[test]
+    fn ready_collects_files_of_new_items() {
+        let (mut app, msgs, _cmds) = app();
+        let items = vec![
+            Item { files: vec![rf("/A.HEIC", 5), rf("/A.MOV", 2)], imported: false },
+            Item { files: vec![rf("/B.JPG", 3)], imported: true },
+        ];
+        msgs.send(Msg::Phone(Phone::Ready { udid: "u".into(), items })).unwrap();
+        app.drain();
+        assert_eq!(app.new, vec![rf("/A.HEIC", 5), rf("/A.MOV", 2)]);
+        assert_eq!(app.new_sum, Summary { photos: 1, videos: 1, bytes: 7 });
     }
 }

@@ -1,16 +1,23 @@
-//! Фоновый поток: держит подключение к iPhone, считает новые, выполняет импорт.
+//! Фоновый поток: держит подключение к iPhone, собирает плитки, читает миниатюры, выполняет импорт.
 use crate::device::{self, ConnectError, Device};
-use crate::import::{self, Progress, RemoteFile, Report, Summary};
+use crate::import::{self, Item, Progress, RemoteFile, Report};
 use crate::journal::Journal;
 use eframe::egui;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Как часто проверять, на месте ли телефон.
+const POLL: Duration = Duration::from_secs(2);
 
 pub enum Cmd {
     SetDest(PathBuf),
-    Import { all: bool },
+    /// Импортировать эти файлы.
+    Import(Vec<RemoteFile>),
+    /// Прочитать миниатюры этих плиток (ключи); заменяет прежнюю очередь.
+    Thumbs(Vec<String>),
 }
 
 /// Что показывать про телефон.
@@ -19,7 +26,7 @@ pub enum Phone {
     NoDevice,
     NotTrusted,
     Scanning,
-    Ready { udid: String, new: Summary, all: Summary },
+    Ready { udid: String, items: Vec<Item> },
 }
 
 pub enum Msg {
@@ -27,6 +34,8 @@ pub enum Msg {
     Progress(Progress),
     Done { report: Report, day: PathBuf },
     Error(String),
+    /// Миниатюра плитки `path`; `None` — её нет.
+    Thumb { path: String, jpeg: Option<Vec<u8>> },
 }
 
 pub fn spawn(dest: PathBuf, ctx: egui::Context, cancel: Arc<AtomicBool>) -> (mpsc::Sender<Cmd>, mpsc::Receiver<Msg>) {
@@ -42,23 +51,30 @@ pub fn spawn(dest: PathBuf, ctx: egui::Context, cancel: Arc<AtomicBool>) -> (mps
     (cmd_tx, msg_rx)
 }
 
+
 fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel: &AtomicBool) {
     let mut dev: Option<Device> = None;
     let mut files: Option<Vec<RemoteFile>> = None;
+    // Миниатюры видимых плиток; каждый `Cmd::Thumbs` заменяет очередь целиком.
+    let mut thumbs: VecDeque<String> = VecDeque::new();
+    let mut polled: Option<Instant> = None;
     loop {
-        if dev.as_ref().is_some_and(|d| !d.still_connected()) {
-            dev = None;
-        }
-        if dev.is_none() {
-            files = None;
-            match device::connect() {
-                Ok(d) => dev = Some(d),
-                Err(ConnectError::NoUsbmuxd) => send(Msg::Phone(Phone::NoUsbmuxd)),
-                Err(ConnectError::NoDevice) => send(Msg::Phone(Phone::NoDevice)),
-                Err(ConnectError::NotTrusted) => send(Msg::Phone(Phone::NotTrusted)),
-                Err(ConnectError::Other(e)) => {
-                    send(Msg::Phone(Phone::NoDevice));
-                    send(Msg::Error(format!("Не удалось подключиться: {e}")));
+        if polled.is_none_or(|t| t.elapsed() >= POLL) {
+            polled = Some(Instant::now());
+            if dev.as_ref().is_some_and(|d| !d.still_connected()) {
+                dev = None;
+            }
+            if dev.is_none() {
+                files = None;
+                match device::connect() {
+                    Ok(d) => dev = Some(d),
+                    Err(ConnectError::NoUsbmuxd) => send(Msg::Phone(Phone::NoUsbmuxd)),
+                    Err(ConnectError::NoDevice) => send(Msg::Phone(Phone::NoDevice)),
+                    Err(ConnectError::NotTrusted) => send(Msg::Phone(Phone::NotTrusted)),
+                    Err(ConnectError::Other(e)) => {
+                        send(Msg::Phone(Phone::NoDevice));
+                        send(Msg::Error(format!("Не удалось подключиться: {e}")));
+                    }
                 }
             }
         }
@@ -76,21 +92,35 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
                 }
             }
         }
-        match cmds.recv_timeout(Duration::from_secs(2)) {
+        if dev.is_none() {
+            thumbs.clear();
+        }
+        // Пока есть миниатюры в очереди, команды не ждём.
+        let cmd = if thumbs.is_empty() {
+            cmds.recv_timeout(POLL)
+        } else {
+            cmds.try_recv().map_err(|e| match e {
+                mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+            })
+        };
+        match cmd {
             Ok(Cmd::SetDest(p)) => {
                 dest = p;
                 if let (Some(d), Some(list)) = (dev.as_ref(), files.as_ref()) {
                     send(ready(&d.udid, list, &dest));
                 }
             }
-            Ok(Cmd::Import { all }) => {
-                let (Some(d), Some(list)) = (dev.as_mut(), files.as_ref()) else { continue };
-                match import_now(d, list, &dest, all, cancel, send) {
+            Ok(Cmd::Import(todo)) => {
+                let (Some(d), Some(_)) = (dev.as_mut(), files.as_ref()) else { continue };
+                thumbs.clear();
+                match import_now(d, &todo, &dest, cancel, send) {
                     Ok((report, day)) => {
                         let lost = matches!(report.stopped, Some(import::Stop::ConnectionLost(_)));
                         send(Msg::Done { report, day });
                         if lost {
                             dev = None;
+                            polled = None;
                         }
                         // Пересчитать заново: на телефоне могли появиться новые снимки.
                         files = None;
@@ -98,33 +128,32 @@ fn run(mut dest: PathBuf, cmds: &mpsc::Receiver<Cmd>, send: &dyn Fn(Msg), cancel
                     Err(e) => send(Msg::Error(e)),
                 }
             }
+            Ok(Cmd::Thumbs(paths)) => thumbs = paths.into(),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        if let (Some(d), Some(path)) = (dev.as_mut(), thumbs.pop_front()) {
+            let jpeg = d.thumbnail(&path);
+            send(Msg::Thumb { path, jpeg });
         }
     }
 }
 
 fn ready(udid: &str, files: &[RemoteFile], dest: &Path) -> Msg {
     match Journal::open(dest) {
-        Ok(j) => Msg::Phone(Phone::Ready {
-            udid: udid.to_string(),
-            new: import::summarize(&import::select(files, &j, false)),
-            all: import::summarize(&import::select(files, &j, true)),
-        }),
+        Ok(j) => Msg::Phone(Phone::Ready { udid: udid.to_string(), items: import::group(files, &j) }),
         Err(e) => Msg::Error(format!("Папка {}: {e}", dest.display())),
     }
 }
 
 fn import_now(
     dev: &mut Device,
-    files: &[RemoteFile],
+    todo: &[RemoteFile],
     dest: &Path,
-    all: bool,
     cancel: &AtomicBool,
     send: &dyn Fn(Msg),
 ) -> Result<(Report, PathBuf), String> {
     let mut journal = Journal::open(dest).map_err(|e| format!("Папка {}: {e}", dest.display()))?;
-    let todo = import::select(files, &journal, all);
     let need: u64 = todo.iter().map(|f| f.size).sum();
     if let Some(free) = import::free_space(dest)
         && free < need
@@ -137,7 +166,7 @@ fn import_now(
     }
     let day = dest.join(chrono::Local::now().format("%Y-%m-%d").to_string());
     import::clean_parts(&day).map_err(|e| format!("Папка {}: {e}", day.display()))?;
-    let report = import::run(&todo, &day, &mut journal, cancel, |f, out| dev.fetch(f, out), |p| {
+    let report = import::run(todo, &day, &mut journal, cancel, |f, out| dev.fetch(f, out), |p| {
         send(Msg::Progress(p.clone()))
     });
     Ok((report, day))

@@ -55,15 +55,6 @@ pub struct Summary {
     pub bytes: u64,
 }
 
-/// Фото и видео из `files`; без `all` — только те, которых нет в журнале.
-pub fn select(files: &[RemoteFile], journal: &Journal, all: bool) -> Vec<RemoteFile> {
-    files
-        .iter()
-        .filter(|f| kind_of(&f.path).is_some() && (all || !journal.contains(&f.path, f.size)))
-        .cloned()
-        .collect()
-}
-
 pub fn summarize(files: &[RemoteFile]) -> Summary {
     let mut s = Summary::default();
     for f in files {
@@ -345,17 +336,6 @@ mod tests {
         assert_eq!(kind_of("/DCIM/100APPLE/IMG_1.MP4"), Some(Kind::Video));
         assert_eq!(kind_of("/DCIM/100APPLE/IMG_1.AAE"), None);
         assert_eq!(kind_of("/DCIM/100APPLE/README"), None);
-    }
-
-    #[test]
-    fn select_skips_journaled_and_non_media() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut j = Journal::open(dir.path()).unwrap();
-        j.record("/DCIM/1/A.HEIC", 5).unwrap();
-        let files = [rf("/DCIM/1/A.HEIC", 5), rf("/DCIM/1/B.MOV", 9), rf("/DCIM/1/A.AAE", 1)];
-
-        assert_eq!(select(&files, &j, false), vec![rf("/DCIM/1/B.MOV", 9)]);
-        assert_eq!(select(&files, &j, true), vec![rf("/DCIM/1/A.HEIC", 5), rf("/DCIM/1/B.MOV", 9)]);
     }
 
     fn paths(items: &[Item]) -> Vec<Vec<&str>> {
